@@ -1,0 +1,282 @@
+close all;
+clc;
+clear;
+
+%% Geometry
+
+R = 0.1;  % Hole Radius, m
+W = 0.5;  % Quarter model width, m
+H = 0.5;  % Quarter model height, m
+
+%% Material, thicknesss, and loading
+E = 200e9;      % Young's modulus, Pa
+nu = 0.3;       % Poisson's ratio
+t = 0.01;       % Plate thickness, m
+T = 1e6;        % Right edge horizontal traction, P
+
+D = E/(1-nu^2)* [1, nu, 0;
+                 nu, 1, 0;
+                 0, 0, (1-nu)/2];
+%% Mesh divisions
+
+nr = 32; % Elements from hole to outer boundary
+nt = 64; %Elements around the quarter circle
+
+% For the square geometry, an even entry places a ray through the outer corner at theta
+
+thetaNodes = linspace(0, pi/2, nt+1);
+
+nNode = (nr+1)*(nt+1);
+coords = zeros(nNode, 2);
+
+%% Generate nodes
+
+for j = 1:nt+1
+    theta = thetaNodes(j);
+
+    c = cos(theta);
+    s = sin(theta);
+
+    % Distance from origin to the right boundary
+    rRight = inf;
+    if c> 1e-12
+        rRight = W/c;
+    end
+
+    % Distance from origin to the top boundary
+    rTop = inf;
+    if s > 1e-12
+        rTop = H/s;
+    end
+
+    % The first outer boundary reached by this ray
+
+    rOuter = min(rRight, rTop);
+    
+    % Nodes from the hole to the outer boundary
+
+    radii = linspace(R, rOuter, nr+1);
+    
+    for i = 1:nr+1
+        node = (j-1)*(nr+1) + i;
+        coords(node, :) = [radii(i)*c, radii(i)*s];
+    end
+end
+
+%% Generate Q4 Connectivity
+% Counter clockwise order
+% inner/lower-angle, outer/lower-angle,
+% outer/higher-angle, inner/higher-angle
+
+nElem = nr*nt;
+elements = zeros(nElem, 4);
+
+for j= 1:nt
+    for i = 1:nr
+        e = (j-1)*nr +i;
+        
+        n1 = (j-1)*(nr+1) +i;
+        n2 = n1+1;
+        n4 = n1+nr+1;
+        n3 = n4+1;
+
+        elements(e,:) = [n1 n2 n3 n4];
+    end
+end
+
+%% Initialize global system
+nDof = 2*nNode;
+K = sparse(nDof, nDof);
+F = zeros(nDof, 1);
+
+gaussPoints = [-1, 1]/sqrt(3);
+minDetJ = inf;
+
+%% Element stiffness and assembly
+
+for e =1:nElem
+    nodes = elements(e,:);
+    xe = coords(nodes,:);
+    dofs = zeros(1,8);
+    for a =1:4
+        dofs(2*a-1 : 2*a) = [2*nodes(a)-1, 2*nodes(a)];
+    end
+    ke =zeros( 8, 8);
+    for g1 =1:2
+        for g2 = 1:2
+            xi = gaussPoints(g1);
+            eta = gaussPoints(g2);
+            dNnatural = 0.25* [-(1-eta), (1-eta), (1+eta), -(1+eta);
+                                -(1-xi), -(1+xi), (1+xi), (1-xi)];
+            J = dNnatural * xe;
+            dNphysical = J \ dNnatural;
+            detJ = det(J);
+            if detJ<=0
+                error("Negative Jacobian determinant in element %d.", e);
+            end
+            minDetJ = min(minDetJ, detJ);
+            
+            B = zeros(3,8);
+
+            for a =1:4
+                dNdx = dNphysical(1,a);
+                dNdy = dNphysical(2,a);
+                B(:,2*a-1:2*a) = [dNdx, 0;
+                                  0,    dNdy;
+                                  dNdy, dNdx];
+            end
+            ke = ke + B.'*D*B*t*detJ;
+        end
+    end
+    K(dofs, dofs) = K(dofs,dofs)+ke;
+end
+fprintf('Minimum Gauss-point det(J) = %.6e m^2\n',minDetJ);
+           
+%% Identity boundary nodes
+
+tol = 1e-10*max(W,H);
+
+leftNodes = find(abs(coords(:,1))<tol);
+bottomNodes = find(abs(coords(:,2))<tol);
+rightNodes = find(abs(coords(:,1)-W)<tol);
+topNodes = find(abs(coords(:,2)-H)<tol);
+
+% First node on each ray lies on the hole
+
+holeNodes = (1:(nr+1):nNode).';
+
+%% Right edge traction
+
+[~, order] = sort(coords(rightNodes,2));
+rightNodes = rightNodes(order);
+
+for k =1:length(rightNodes)-1
+    n1 = rightNodes(k);
+    n2 = rightNodes(k+1);
+
+    edgelength = norm(coords(n2,:)- coords(n1,:));
+    edgeForce = T*t*edgelength;
+
+    F(2*n1-1) = F(2*n1-1) + edgeForce/2;
+    F(2*n2-1) = F(2*n2-1) + edgeForce/2;
+end
+
+%% Symmetry BCs
+% Left boundary : u=0
+% Bottom boundary: v=0
+fixedDofs = unique([2*leftNodes-1;
+                    2*bottomNodes]);
+freedofs = setdiff((1:nDof), fixedDofs);
+U = zeros(nDof ,1);
+U(freedofs) = K(freedofs, freedofs)\ F(freedofs);
+u = U(1:2:end);
+v = U(2:2:end);
+R = K*U -F;
+
+%% Euilibrium checks
+fprintf("Applied horizontal force = %.6f N\n", sum(F(1:2:end)));
+fprintf("Horizontal reaction force = %.6f N\n", sum(R(1:2:end)));
+fprintf("Applied vertical force = %.6f N\n", sum(F(2:2:end)));
+fprintf("Maximum Horizontal displacement = %.6f mm\n", max(u)*1000);
+
+%% Recover stress at 4 gauss points of each element
+% Stress ordering: [sigma_xx; sigma_yy; tau_xy]
+
+for e =1:nElem
+    nodes = elements(e, :);
+    xe = coords(nodes, :);
+    dofs = zeros(1,8);
+    for a =1:4
+        dofs(2*a-1 : 2*a) = [2*nodes(a)-1, 2*nodes(a)];
+    end
+    Ue = U(dofs);
+    gp = 0;
+    for g1 = 1:2
+        for g2 = 1:2
+            gp = gp+1;
+            xi = gaussPoints(g1);
+            eta = gaussPoints(g2);
+
+            N = 0.25* [(1-xi)*(1-eta), (1+xi)*(1-eta), (1+xi)*(1+eta), (1-xi)*(1+eta)];
+
+            dNnatural = 0.25* [-(1-eta), (1-eta), (1+eta), -(1+eta); ...
+                               -(1-xi),   -(1+xi), (1+xi), (1-xi)];
+
+            J = dNnatural*xe;
+            dNphysical = J \ dNnatural;
+            detJ = det(J);
+            
+            B =zeros(3,8);
+
+            for a =1:4
+                dNdx = dNphysical(1,a);
+                dNdy = dNphysical(2,a);
+                B(:,2*a-1:2*a) = [dNdx, 0;
+                    0,    dNdy;
+                    dNdy, dNdx];
+            end
+            strain = B*Ue;
+           % disp(gp);
+            stressGP(:,gp,e) = D*strain;
+            gpCoords(gp, :, e) = N*xe;
+        end
+    end
+end
+
+%% Average sigma_xx within each element for plotiing
+sigma_xx =  zeros(nElem, 1);
+for e =1:nElem
+    sigma_xx(e) = mean(stressGP(1, :, e));
+end
+figure;
+patch(Faces= elements, Vertices = coords, FaceVertexCData = sigma_xx/1e6, FaceColor='flat', EdgeColor= 'none');
+xlabel('x , m');
+ylabel('y , m');
+title('Element average horizontal stress sigma_xx (MPa)');
+colorbar;
+axis equal;
+grid on;
+
+%% Largest sigma_xx among all Gauss points
+allsigmaxx = reshape(stressGP(1,:,:), [], 1);
+fprintf('maximum Gauss point sigma_xx = %0.6f MPa\n',max(allsigmaxx)/1e6);
+fprintf('minimum Gauss point sigma_xx = %0.6f MPa\n',min(allsigmaxx)/1e6);
+fprintf('Maximum stress/strain ratio = %0.6f\n', max(abs(allsigmaxx))/max(abs(strain)));
+fprintf('Minimum stress/strain ratio = %0.6f\n', min(abs(allsigmaxx))/max(abs(strain)));
+fprintf('Maximum sampled sigma_xx / applied traction = %0.6f \n',max(allsigmaxx)/T);
+%% plot the mesh and boundaries
+
+figure;
+patch("Faces", elements, "Vertices", coords, 'FaceColor', 'none', "EdgeColor", [0.5, 0.5, 0.5], "HandleVisibility", 'off');
+hold on;
+
+plot(coords(holeNodes,1), coords(holeNodes, 2), 'r-o', LineWidth= 1.5, DisplayName='Hole Boundary');
+plot(coords(leftNodes,1), coords(leftNodes,2), 'bs', LineWidth= 1.5, DisplayName='Left symmetry boundary');
+plot(coords(rightNodes,1), coords(rightNodes,2), 'm', MarkerSize= 14, DisplayName='Right loaded boundary');
+plot(coords(topNodes,1), coords(topNodes,2), 'c.', MarkerSize= 14, DisplayName='Top free surface');
+plot(coords(bottomNodes,1), coords(bottomNodes,2), 'go', DisplayName='Bottom symmetry boundary');
+
+xlabel('x , m');
+ylabel('y , m');
+axis equal;
+legend(Location='best');
+grid on;
+title("Q4 Mesh for the quarter of the plate with a hole");
+hold off;
+
+fprintf('Number of nodes = %d\n',nNode);
+fprintf('Number of elements = %d\n',nElem);
+
+
+% Find the element and Gauss point with maximum sigma_xx
+sigmaSamples = reshape(stressGP(1,:,:), 4, nElem);
+
+[maxSigma, index] = max(sigmaSamples(:));
+[gpMax, elemMax] = ind2sub(size(sigmaSamples), index);
+
+peakPosition = gpCoords(gpMax, :, elemMax);
+
+fprintf('Maximum sampled sigma_xx = %.6f MPa\n', maxSigma/1e6);
+fprintf('Sampled stress ratio     = %.6f\n', maxSigma/T);
+fprintf('Peak position: x = %.6f m, y = %.6f m\n', ...
+    peakPosition(1), peakPosition(2));
